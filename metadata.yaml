@@ -1,0 +1,9 @@
+name: astrbot_plugin_essence
+display_name: 神人语句加精
+desc: 自动识别群聊中的神人语句或经典语句，并将其设为精华消息。支持自动分析和手动加精两种模式。
+version: v0.0.1
+author: CherishDreams
+repo: https://github.com/CherishDreams/astrbot_plugin_essence
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.16,<5"
