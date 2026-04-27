@@ -83,12 +83,6 @@
         "default": "/加精",
         "hint": "管理员可通过 '/加精 <message_id>' 直接加精指定消息"
       },
-      "analyze_command": {
-        "description": "主动分析指令前缀",
-        "type": "string",
-        "default": "/分析加精",
-        "hint": "管理员可通过 '/分析加精 <数量>' 获取历史消息并分析加精，如 '/分析加精 100'"
-      },
       "max_history_per_analysis": {
         "description": "主动分析最大消息数量",
         "type": "int",

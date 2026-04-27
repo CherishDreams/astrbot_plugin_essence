@@ -83,7 +83,6 @@ class EssenceMessagePlugin(Star):
         commands = self.config.get("commands", {})
         self.manual_command = commands.get("manual_command", "加精")
         self.essence_by_id_command = commands.get("essence_by_id_command", "/加精")
-        self.analyze_command = commands.get("analyze_command", "/分析加精")
         self.max_history_per_analysis = commands.get("max_history_per_analysis", 200)
 
         # 并发控制锁
@@ -272,20 +271,18 @@ class EssenceMessagePlugin(Star):
     # ===== 手动加精模式 =====
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    async def on_admin_command(self, event: AstrMessageEvent):
-        """处理手动加精指令（在内部检查权限，避免非管理员触发日志）"""
+    async def on_manual_essence(self, event: AstrMessageEvent):
+        """处理手动加精（回复加精和指定ID加精）"""
         if not self.manual_essence_enabled:
             return
 
-        # 先检查消息是否匹配指令模式，不匹配则跳过
+        # 检查是否是手动加精相关指令
         message_str = event.message_str.strip()
 
-        # 检查是否是相关指令
         is_reply_essence = message_str == self.manual_command
         is_id_essence = message_str.startswith(self.essence_by_id_command)
-        is_analyze = message_str.startswith(self.analyze_command)
 
-        if not (is_reply_essence or is_id_essence or is_analyze):
+        if not (is_reply_essence or is_id_essence):
             return
 
         # 匹配指令后检查权限
@@ -301,11 +298,52 @@ class EssenceMessagePlugin(Star):
         # 处理指定消息ID加精
         if is_id_essence:
             await self._handle_id_essence(event)
+
+    # ===== 主动分析指令 =====
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.command("分析加精")
+    async def analyze_essence(self, event: AstrMessageEvent, count: int | None = None):
+        """主动分析历史消息并加精。用法: /分析加精 [数量]，如 /分析加精 100"""
+        if not isinstance(event, AiocqhttpMessageEvent):
+            yield event.plain_result("当前平台不支持历史消息获取")
             return
 
-        # 处理主动分析
-        if is_analyze:
-            await self._handle_analyze_command(event)
+        group_id = str(event.get_group_id())
+        bot = event.bot
+
+        # 解析分析数量
+        actual_count = count if count and count > 0 else self.message_threshold
+        if actual_count > self.max_history_per_analysis:
+            actual_count = self.max_history_per_analysis
+
+        yield event.plain_result(f"正在获取群 {group_id} 的 {actual_count} 条历史消息进行分析...")
+
+        logger.info(f"主动分析指令: 获取群 {group_id} 的 {actual_count} 条历史消息")
+
+        # 获取历史消息
+        try:
+            messages = await self._get_group_history(bot, group_id, actual_count)
+            if not messages:
+                logger.warning(f"获取群 {group_id} 历史消息失败或为空")
+                await self.context.send_message(
+                    event.session,
+                    [Plain(text="获取历史消息失败，可能没有消息或 API 不支持")]
+                )
+                return
+
+            logger.info(f"获取到 {len(messages)} 条历史消息，开始 LLM 分析")
+
+            # 分析并加精
+            await self._analyze_messages_and_essence(event, messages, group_id)
+
+        except Exception as e:
+            logger.error(f"主动分析失败: {e}")
+            await self.context.send_message(
+                event.session,
+                [Plain(text=f"分析失败: {e}")]
+            )
 
     async def _handle_reply_essence(self, event: AstrMessageEvent) -> None:
         """处理回复消息加精（回复消息后发送指令）"""
@@ -339,60 +377,6 @@ class EssenceMessagePlugin(Star):
 
         msg_id = parts[1].strip()
         await self._set_essence(event, msg_id)
-
-    async def _handle_analyze_command(self, event: AstrMessageEvent) -> None:
-        """处理主动分析指令"""
-        if not isinstance(event, AiocqhttpMessageEvent):
-            event.set_result(event.plain_result("当前平台不支持历史消息获取"))
-            return
-
-        message_str = event.message_str.strip()
-        parts = message_str.split()
-
-        # 解析分析数量
-        count = self.message_threshold  # 默认使用阈值配置
-        if len(parts) >= 2:
-            try:
-                count = int(parts[1])
-                if count <= 0:
-                    event.set_result(event.plain_result("消息数量必须大于0"))
-                    return
-                if count > self.max_history_per_analysis:
-                    count = self.max_history_per_analysis
-            except ValueError:
-                event.set_result(event.plain_result(f"无效的数量参数，用法: {self.analyze_command} <数量>"))
-                return
-
-        group_id = str(event.get_group_id())
-        bot = event.bot
-
-        event.set_result(event.plain_result(f"正在获取群 {group_id} 的 {count} 条历史消息进行分析..."))
-
-        logger.info(f"主动分析: 获取群 {group_id} 的 {count} 条历史消息")
-
-        # 获取历史消息
-        try:
-            messages = await self._get_group_history(bot, group_id, count)
-            if not messages:
-                logger.warning(f"获取群 {group_id} 历史消息失败或为空")
-                # 直接发送结果，不通过 event.set_result（因为已经设置了）
-                await self.context.send_message(
-                    event.session,
-                    [Plain(text="获取历史消息失败，可能没有消息或 API 不支持")]
-                )
-                return
-
-            logger.info(f"获取到 {len(messages)} 条历史消息，开始 LLM 分析")
-
-            # 分析并加精
-            await self._analyze_messages_and_essence(event, messages, group_id)
-
-        except Exception as e:
-            logger.error(f"主动分析失败: {e}")
-            await self.context.send_message(
-                event.session,
-                [Plain(text=f"分析失败: {e}")]
-            )
 
     async def _get_group_history(
         self, bot, group_id: str, count: int
