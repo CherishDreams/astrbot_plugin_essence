@@ -68,6 +68,7 @@ class EssenceMessagePlugin(Star):
         basic = self.config.get("basic", {})
         self.auto_essence_enabled = basic.get("auto_essence_enabled", True)
         self.manual_essence_enabled = basic.get("manual_essence_enabled", True)
+        self.debug_mode = basic.get("debug_mode", False)
         self.message_threshold = basic.get("message_threshold", 50)
         self.max_essence_per_analysis = basic.get("max_essence_per_analysis", 3)
         self.group_whitelist = [str(g) for g in basic.get("group_whitelist", [])]
@@ -95,10 +96,18 @@ class EssenceMessagePlugin(Star):
             f"神人语句加精插件初始化完成: "
             f"自动加精={self.auto_essence_enabled}, "
             f"手动加精={self.manual_essence_enabled}, "
+            f"调试模式={self.debug_mode}, "
             f"阈值={self.message_threshold}, "
             f"每次最多加精={self.max_essence_per_analysis}, "
             f"白名单={len(self.group_whitelist)}群"
         )
+
+    def _log(self, message: str) -> None:
+        """输出日志（debug模式下使用info级别）"""
+        if self.debug_mode:
+            logger.info(f"[精华插件] {message}")
+        else:
+            logger.debug(f"[精华插件] {message}")
 
     def _get_group_lock(self, group_id: str) -> asyncio.Lock:
         """获取群的分析锁"""
@@ -116,13 +125,19 @@ class EssenceMessagePlugin(Star):
             return
 
         # 跳过机器人自己的消息
-        if event.get_sender_id() == event.get_self_id():
+        sender_id = event.get_sender_id()
+        self_id = event.get_self_id()
+        if sender_id == self_id:
+            self._log(f"跳过机器人自己的消息: sender_id={sender_id}")
             return
 
         # 检查白名单
         group_id = str(event.get_group_id())
         if self.group_whitelist and group_id not in self.group_whitelist:
+            self._log(f"群 {group_id} 不在白名单中，跳过")
             return
+
+        self._log(f"收到群 {group_id} 消息: {event.message_str[:50]}...")
 
         # 缓存消息
         await self._buffer_message(event)
@@ -131,12 +146,15 @@ class EssenceMessagePlugin(Star):
         buffer = await self._get_buffer(group_id)
         msg_count = len(buffer.get("messages", []))
 
+        self._log(f"群 {group_id} 当前缓存消息数: {msg_count}/{self.message_threshold}")
+
         if msg_count >= self.message_threshold:
             lock = self._get_group_lock(group_id)
             if lock.locked():
-                logger.debug(f"群 {group_id} 正在分析中，跳过本次触发")
+                self._log(f"群 {group_id} 正在分析中，跳过本次触发")
                 return
             async with lock:
+                self._log(f"群 {group_id} 达到阈值，开始分析")
                 await self._analyze_and_essence(event, group_id, buffer)
 
     async def _buffer_message(self, event: AstrMessageEvent) -> None:
@@ -157,7 +175,12 @@ class EssenceMessagePlugin(Star):
 
         buffer["messages"].append(message_entry)
         await self.put_kv_data(key, buffer)
-        logger.debug(f"已缓存消息 {message_entry['message_id']} 来自群 {group_id}")
+
+        self._log(
+            f"已缓存消息: id={message_entry['message_id']}, "
+            f"群={group_id}, 发送者={message_entry['sender_name']}, "
+            f"内容={message_entry['content'][:30]}..."
+        )
 
     async def _get_buffer(self, group_id: str) -> dict:
         """获取群消息缓冲区"""
@@ -173,6 +196,8 @@ class EssenceMessagePlugin(Star):
         self, event: AstrMessageEvent, group_id: str, buffer: dict
     ) -> None:
         """调用 LLM 分析消息并加精"""
+        self._log(f"开始分析群 {group_id} 的 {len(buffer['messages'])} 条消息")
+
         messages_json = json.dumps(buffer["messages"], ensure_ascii=False, indent=2)
 
         prompt = self.judge_prompt.format(
@@ -180,7 +205,7 @@ class EssenceMessagePlugin(Star):
             max_essence=self.max_essence_per_analysis,
         )
 
-        logger.info(f"开始 LLM 分析群 {group_id} 的 {len(buffer['messages'])} 条消息")
+        self._log(f"生成 prompt 长度: {len(prompt)} 字符")
 
         # 获取 LLM 提供商
         llm_resp = None
@@ -188,32 +213,34 @@ class EssenceMessagePlugin(Star):
             if self.judge_provider_id:
                 provider = self.context.get_provider_by_id(self.judge_provider_id)
                 if provider:
+                    self._log(f"使用配置的模型提供商: {self.judge_provider_id}")
                     llm_resp = await provider.text_chat(
                         prompt=prompt, contexts=[], image_urls=[]
                     )
                 else:
-                    logger.warning(
-                        f"配置的模型提供商不存在: {self.judge_provider_id}, 使用默认模型"
-                    )
+                    self._log(f"配置的模型提供商不存在: {self.judge_provider_id}, 使用默认模型")
 
             if not llm_resp:
                 default_provider_id = await self.context.get_current_chat_provider_id(
                     umo=event.unified_msg_origin
                 )
                 if default_provider_id:
+                    self._log(f"使用默认模型提供商: {default_provider_id}")
                     llm_resp = await self.context.llm_generate(
                         chat_provider_id=default_provider_id,
                         prompt=prompt,
                     )
                 else:
-                    logger.warning("无法获取当前聊天模型 ID")
+                    self._log("无法获取当前聊天模型 ID")
                     await self._clear_buffer(group_id)
                     return
 
             if not llm_resp or not llm_resp.completion_text:
-                logger.warning("LLM 返回空响应")
+                self._log("LLM 返回空响应")
                 await self._clear_buffer(group_id)
                 return
+
+            self._log(f"LLM 返回响应长度: {len(llm_resp.completion_text)} 字符")
 
         except Exception as e:
             logger.error(f"LLM 分析调用失败: {e}")
@@ -223,8 +250,10 @@ class EssenceMessagePlugin(Star):
         # 解析结果
         essence_ids, reasons = self._parse_llm_result(llm_resp.completion_text)
 
+        self._log(f"解析结果: essence_ids={essence_ids}")
+
         if essence_ids:
-            logger.info(f"LLM 识别出 {len(essence_ids)} 条神人语句")
+            self._log(f"LLM 识别出 {len(essence_ids)} 条神人语句")
             # 获取 bot 客户端并加精
             if isinstance(event, AiocqhttpMessageEvent):
                 bot = event.bot
@@ -234,15 +263,15 @@ class EssenceMessagePlugin(Star):
                             "set_essence_msg", message_id=int(msg_id)
                         )
                         reason = reasons.get(msg_id, "无理由")
-                        logger.info(f"已加精消息 {msg_id}: {reason}")
+                        self._log(f"加精成功: msg_id={msg_id}, reason={reason}")
                     except Exception as e:
                         logger.error(f"加精消息 {msg_id} 失败: {e}")
             else:
-                logger.warning("非 aiocqhttp 平台事件，无法调用加精 API")
+                self._log("非 aiocqhttp 平台事件，无法调用加精 API")
 
         # 清空缓冲区
         await self._clear_buffer(group_id)
-        logger.info(f"群 {group_id} 分析完成，已清理缓冲区")
+        self._log(f"群 {group_id} 分析完成，已清理缓冲区")
 
     def _parse_llm_result(
         self, response_text: str
