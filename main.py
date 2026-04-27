@@ -109,6 +109,32 @@ class EssenceMessagePlugin(Star):
         else:
             logger.debug(f"[精华插件] {message}")
 
+    def _should_process(self, event: AstrMessageEvent) -> bool:
+        """检查消息是否应该被处理（白名单过滤）"""
+        if not self.group_whitelist:
+            return True
+
+        # 获取会话ID和群ID
+        session_id = event.unified_msg_origin
+        group_id = event.get_group_id()
+
+        self._log(f"白名单检查: session_id={session_id}, group_id={group_id}, whitelist={self.group_whitelist}")
+
+        # 检查是否在白名单中（支持完整会话ID或简写群号）
+        for item in self.group_whitelist:
+            item_str = str(item)
+            # 完整会话ID匹配
+            if item_str == session_id:
+                self._log(f"白名单匹配: session_id={session_id}")
+                return True
+            # 简写群号匹配
+            if group_id and str(group_id) == item_str:
+                self._log(f"白名单匹配: group_id={group_id}")
+                return True
+
+        self._log(f"白名单不匹配，跳过处理")
+        return False
+
     def _get_group_lock(self, group_id: str) -> asyncio.Lock:
         """获取群的分析锁"""
         if group_id not in self._analysis_locks:
@@ -132,11 +158,11 @@ class EssenceMessagePlugin(Star):
             return
 
         # 检查白名单
-        group_id = str(event.get_group_id())
-        if self.group_whitelist and group_id not in self.group_whitelist:
-            self._log(f"群 {group_id} 不在白名单中，跳过")
+        if not self._should_process(event):
+            self._log(f"群不在白名单中，跳过")
             return
 
+        group_id = str(event.get_group_id())
         self._log(f"收到群 {group_id} 消息: {event.message_str[:50]}...")
 
         # 缓存消息
