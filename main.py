@@ -10,10 +10,11 @@ import time
 import asyncio
 from typing import Any
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
 from astrbot.api.message_components import Reply, Plain
+from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
@@ -45,17 +46,17 @@ class EssenceMessagePlugin(Star):
 
 ## 输出要求
 请严格按照以下JSON格式输出，不要输出其他内容：
-{
+{{
   "essence_ids": ["消息ID1", "消息ID2", ...],
-  "reasons": {
+  "reasons": {{
     "消息ID1": "加精理由",
     "消息ID2": "加精理由"
-  }
-}
+  }}
+}}
 
 注意：
 - essence_ids 列表最多包含 {max_essence} 个消息ID
-- 如果没有合适的内容，返回空列表 {"essence_ids": [], "reasons": {}}
+- 如果没有合适的内容，返回空列表 {{\"essence_ids\": [], \"reasons\": {{}}}}
 - 只返回你认为最值得加精的消息，宁缺毋滥
 """
 
@@ -329,7 +330,7 @@ class EssenceMessagePlugin(Star):
                 logger.warning(f"获取群 {group_id} 历史消息失败或为空")
                 await self.context.send_message(
                     event.session,
-                    [Plain(text="获取历史消息失败，可能没有消息或 API 不支持")]
+                    MessageChain([Plain(text="获取历史消息失败，可能没有消息或 API 不支持")])
                 )
                 return
 
@@ -342,7 +343,7 @@ class EssenceMessagePlugin(Star):
             logger.error(f"主动分析失败: {e}")
             await self.context.send_message(
                 event.session,
-                [Plain(text=f"分析失败: {e}")]
+                MessageChain([Plain(text=f"分析失败: {e}")])
             )
 
     async def _handle_reply_essence(self, event: AstrMessageEvent) -> None:
@@ -464,14 +465,14 @@ class EssenceMessagePlugin(Star):
                 else:
                     await self.context.send_message(
                         event.session,
-                        [Plain(text="无法获取 LLM 模型")]
+                        MessageChain([Plain(text="无法获取 LLM 模型")])
                     )
                     return
 
             if not llm_resp or not llm_resp.completion_text:
                 await self.context.send_message(
                     event.session,
-                    [Plain(text="LLM 返回空响应")]
+                    MessageChain([Plain(text="LLM 返回空响应")])
                 )
                 return
 
@@ -479,7 +480,7 @@ class EssenceMessagePlugin(Star):
             logger.error(f"LLM 分析调用失败: {e}")
             await self.context.send_message(
                 event.session,
-                [Plain(text=f"LLM 分析失败: {e}")]
+                MessageChain([Plain(text=f"LLM 分析失败: {e}")])
             )
             return
 
@@ -501,12 +502,12 @@ class EssenceMessagePlugin(Star):
 
             await self.context.send_message(
                 event.session,
-                [Plain(text=f"分析完成，共识别 {len(essence_ids)} 条神人语句，成功加精 {success_count} 条")]
+                MessageChain([Plain(text=f"分析完成，共识别 {len(essence_ids)} 条神人语句，成功加精 {success_count} 条")])
             )
         else:
             await self.context.send_message(
                 event.session,
-                [Plain(text="分析完成，未识别到神人语句")]
+                MessageChain([Plain(text="分析完成，未识别到神人语句")])
             )
 
         logger.info(f"群 {group_id} 主动分析完成")
