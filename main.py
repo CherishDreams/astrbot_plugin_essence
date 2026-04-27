@@ -13,7 +13,7 @@ from typing import Any
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api import logger
-from astrbot.api.message_components import Reply
+from astrbot.api.message_components import Reply, Plain
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
     AiocqhttpMessageEvent,
 )
@@ -83,6 +83,8 @@ class EssenceMessagePlugin(Star):
         commands = self.config.get("commands", {})
         self.manual_command = commands.get("manual_command", "加精")
         self.essence_by_id_command = commands.get("essence_by_id_command", "/加精")
+        self.analyze_command = commands.get("analyze_command", "/分析加精")
+        self.max_history_per_analysis = commands.get("max_history_per_analysis", 200)
 
         # 并发控制锁
         self._analysis_locks: dict[str, asyncio.Lock] = {}
@@ -270,17 +272,40 @@ class EssenceMessagePlugin(Star):
     # ===== 手动加精模式 =====
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    async def on_admin_message(self, event: AstrMessageEvent):
-        """处理管理员的手动加精指令"""
+    async def on_admin_command(self, event: AstrMessageEvent):
+        """处理手动加精指令（在内部检查权限，避免非管理员触发日志）"""
         if not self.manual_essence_enabled:
             return
 
+        # 先检查消息是否匹配指令模式，不匹配则跳过
+        message_str = event.message_str.strip()
+
+        # 检查是否是相关指令
+        is_reply_essence = message_str == self.manual_command
+        is_id_essence = message_str.startswith(self.essence_by_id_command)
+        is_analyze = message_str.startswith(self.analyze_command)
+
+        if not (is_reply_essence or is_id_essence or is_analyze):
+            return
+
+        # 匹配指令后检查权限
+        if event.role != "admin":
+            event.set_result(event.plain_result("权限不足：只有管理员可以使用此指令"))
+            return
+
         # 处理回复消息加精
-        await self._handle_reply_essence(event)
+        if is_reply_essence:
+            await self._handle_reply_essence(event)
+            return
 
         # 处理指定消息ID加精
-        await self._handle_id_essence(event)
+        if is_id_essence:
+            await self._handle_id_essence(event)
+            return
+
+        # 处理主动分析
+        if is_analyze:
+            await self._handle_analyze_command(event)
 
     async def _handle_reply_essence(self, event: AstrMessageEvent) -> None:
         """处理回复消息加精（回复消息后发送指令）"""
@@ -314,6 +339,193 @@ class EssenceMessagePlugin(Star):
 
         msg_id = parts[1].strip()
         await self._set_essence(event, msg_id)
+
+    async def _handle_analyze_command(self, event: AstrMessageEvent) -> None:
+        """处理主动分析指令"""
+        if not isinstance(event, AiocqhttpMessageEvent):
+            event.set_result(event.plain_result("当前平台不支持历史消息获取"))
+            return
+
+        message_str = event.message_str.strip()
+        parts = message_str.split()
+
+        # 解析分析数量
+        count = self.message_threshold  # 默认使用阈值配置
+        if len(parts) >= 2:
+            try:
+                count = int(parts[1])
+                if count <= 0:
+                    event.set_result(event.plain_result("消息数量必须大于0"))
+                    return
+                if count > self.max_history_per_analysis:
+                    count = self.max_history_per_analysis
+            except ValueError:
+                event.set_result(event.plain_result(f"无效的数量参数，用法: {self.analyze_command} <数量>"))
+                return
+
+        group_id = str(event.get_group_id())
+        bot = event.bot
+
+        event.set_result(event.plain_result(f"正在获取群 {group_id} 的 {count} 条历史消息进行分析..."))
+
+        logger.info(f"主动分析: 获取群 {group_id} 的 {count} 条历史消息")
+
+        # 获取历史消息
+        try:
+            messages = await self._get_group_history(bot, group_id, count)
+            if not messages:
+                logger.warning(f"获取群 {group_id} 历史消息失败或为空")
+                # 直接发送结果，不通过 event.set_result（因为已经设置了）
+                await self.context.send_message(
+                    event.session,
+                    [Plain(text="获取历史消息失败，可能没有消息或 API 不支持")]
+                )
+                return
+
+            logger.info(f"获取到 {len(messages)} 条历史消息，开始 LLM 分析")
+
+            # 分析并加精
+            await self._analyze_messages_and_essence(event, messages, group_id)
+
+        except Exception as e:
+            logger.error(f"主动分析失败: {e}")
+            await self.context.send_message(
+                event.session,
+                [Plain(text=f"分析失败: {e}")]
+            )
+
+    async def _get_group_history(
+        self, bot, group_id: str, count: int
+    ) -> list[dict]:
+        """获取群历史消息"""
+        messages = []
+
+        try:
+            # 尝试调用 get_group_msg_history (NapCat/LLOneBot)
+            result = await bot.call_action(
+                "get_group_msg_history",
+                group_id=int(group_id),
+            )
+
+            if result and "messages" in result:
+                raw_messages = result["messages"]
+                # 截取指定数量
+                raw_messages = raw_messages[-count:] if len(raw_messages) > count else raw_messages
+
+                for msg in raw_messages:
+                    # 解析消息内容
+                    message_id = str(msg.get("message_id", ""))
+                    sender_id = str(msg.get("user_id", ""))
+                    sender_name = msg.get("card", "") or msg.get("nickname", "") or "匿名用户"
+
+                    # 提取纯文本内容
+                    content = ""
+                    message_chain = msg.get("message", [])
+                    if isinstance(message_chain, list):
+                        for seg in message_chain:
+                            if isinstance(seg, dict) and seg.get("type") == "text":
+                                content += seg.get("data", {}).get("text", "")
+                    elif isinstance(message_chain, str):
+                        content = message_chain
+
+                    if message_id and content.strip():
+                        messages.append({
+                            "message_id": message_id,
+                            "sender_id": sender_id,
+                            "sender_name": sender_name,
+                            "content": content.strip(),
+                            "timestamp": msg.get("time", 0),
+                            "group_id": group_id,
+                        })
+
+        except Exception as e:
+            logger.warning(f"get_group_msg_history API 调用失败: {e}")
+
+        return messages
+
+    async def _analyze_messages_and_essence(
+        self, event: AstrMessageEvent, messages: list[dict], group_id: str
+    ) -> None:
+        """分析历史消息并加精"""
+        messages_json = json.dumps(messages, ensure_ascii=False, indent=2)
+
+        prompt = self.judge_prompt.format(
+            messages_json=messages_json,
+            max_essence=self.max_essence_per_analysis,
+        )
+
+        # 获取 LLM 提供商
+        llm_resp = None
+        try:
+            if self.judge_provider_id:
+                provider = self.context.get_provider_by_id(self.judge_provider_id)
+                if provider:
+                    llm_resp = await provider.text_chat(
+                        prompt=prompt, contexts=[], image_urls=[]
+                    )
+                else:
+                    logger.warning(
+                        f"配置的模型提供商不存在: {self.judge_provider_id}, 使用默认模型"
+                    )
+
+            if not llm_resp:
+                default_provider_id = await self.context.get_current_chat_provider_id(
+                    umo=event.unified_msg_origin
+                )
+                if default_provider_id:
+                    llm_resp = await self.context.llm_generate(
+                        chat_provider_id=default_provider_id,
+                        prompt=prompt,
+                    )
+                else:
+                    await self.context.send_message(
+                        event.session,
+                        [Plain(text="无法获取 LLM 模型")]
+                    )
+                    return
+
+            if not llm_resp or not llm_resp.completion_text:
+                await self.context.send_message(
+                    event.session,
+                    [Plain(text="LLM 返回空响应")]
+                )
+                return
+
+        except Exception as e:
+            logger.error(f"LLM 分析调用失败: {e}")
+            await self.context.send_message(
+                event.session,
+                [Plain(text=f"LLM 分析失败: {e}")]
+            )
+            return
+
+        # 解析结果
+        essence_ids, reasons = self._parse_llm_result(llm_resp.completion_text)
+
+        if essence_ids:
+            logger.info(f"主动分析识别出 {len(essence_ids)} 条神人语句")
+            bot = event.bot
+            success_count = 0
+            for msg_id in essence_ids:
+                try:
+                    await bot.call_action("set_essence_msg", message_id=int(msg_id))
+                    reason = reasons.get(msg_id, "无理由")
+                    logger.info(f"已加精消息 {msg_id}: {reason}")
+                    success_count += 1
+                except Exception as e:
+                    logger.error(f"加精消息 {msg_id} 失败: {e}")
+
+            await self.context.send_message(
+                event.session,
+                [Plain(text=f"分析完成，共识别 {len(essence_ids)} 条神人语句，成功加精 {success_count} 条")]
+            )
+        else:
+            await self.context.send_message(
+                event.session,
+                [Plain(text="分析完成，未识别到神人语句")]
+            )
+
+        logger.info(f"群 {group_id} 主动分析完成")
 
     async def _set_essence(self, event: AstrMessageEvent, message_id: str) -> None:
         """调用 OneBot API 设置精华消息"""
