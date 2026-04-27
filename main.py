@@ -232,6 +232,7 @@ class EssenceMessagePlugin(Star):
         )
 
         self._log(f"生成 prompt 长度: {len(prompt)} 字符")
+        self._log(f"完整 prompt:\n{prompt}")
 
         # 获取 LLM 提供商
         llm_resp = None
@@ -267,6 +268,7 @@ class EssenceMessagePlugin(Star):
                 return
 
             self._log(f"LLM 返回响应长度: {len(llm_resp.completion_text)} 字符")
+            self._log(f"LLM 原始响应:\n{llm_resp.completion_text}")
 
         except Exception as e:
             logger.error(f"LLM 分析调用失败: {e}")
@@ -487,6 +489,8 @@ class EssenceMessagePlugin(Star):
         self, event: AstrMessageEvent, messages: list[dict], group_id: str
     ) -> None:
         """分析历史消息并加精"""
+        self._log(f"主动分析: 开始分析群 {group_id} 的 {len(messages)} 条历史消息")
+
         messages_json = json.dumps(messages, ensure_ascii=False, indent=2)
 
         prompt = self.judge_prompt.format(
@@ -494,25 +498,28 @@ class EssenceMessagePlugin(Star):
             max_essence=self.max_essence_per_analysis,
         )
 
+        self._log(f"生成 prompt 长度: {len(prompt)} 字符")
+        self._log(f"完整 prompt:\n{prompt}")
+
         # 获取 LLM 提供商
         llm_resp = None
         try:
             if self.judge_provider_id:
                 provider = self.context.get_provider_by_id(self.judge_provider_id)
                 if provider:
+                    self._log(f"使用配置的模型提供商: {self.judge_provider_id}")
                     llm_resp = await provider.text_chat(
                         prompt=prompt, contexts=[], image_urls=[]
                     )
                 else:
-                    logger.warning(
-                        f"配置的模型提供商不存在: {self.judge_provider_id}, 使用默认模型"
-                    )
+                    self._log(f"配置的模型提供商不存在: {self.judge_provider_id}, 使用默认模型")
 
             if not llm_resp:
                 default_provider_id = await self.context.get_current_chat_provider_id(
                     umo=event.unified_msg_origin
                 )
                 if default_provider_id:
+                    self._log(f"使用默认模型提供商: {default_provider_id}")
                     llm_resp = await self.context.llm_generate(
                         chat_provider_id=default_provider_id,
                         prompt=prompt,
@@ -531,6 +538,9 @@ class EssenceMessagePlugin(Star):
                 )
                 return
 
+            self._log(f"LLM 返回响应长度: {len(llm_resp.completion_text)} 字符")
+            self._log(f"LLM 原始响应:\n{llm_resp.completion_text}")
+
         except Exception as e:
             logger.error(f"LLM 分析调用失败: {e}")
             await self.context.send_message(
@@ -542,15 +552,17 @@ class EssenceMessagePlugin(Star):
         # 解析结果
         essence_ids, reasons = self._parse_llm_result(llm_resp.completion_text)
 
+        self._log(f"解析结果: essence_ids={essence_ids}, reasons={reasons}")
+
         if essence_ids:
-            logger.info(f"主动分析识别出 {len(essence_ids)} 条神人语句")
+            self._log(f"主动分析识别出 {len(essence_ids)} 条神人语句")
             bot = event.bot
             success_count = 0
             for msg_id in essence_ids:
                 try:
                     await bot.call_action("set_essence_msg", message_id=int(msg_id))
                     reason = reasons.get(msg_id, "无理由")
-                    logger.info(f"已加精消息 {msg_id}: {reason}")
+                    self._log(f"加精成功: msg_id={msg_id}, reason={reason}")
                     success_count += 1
                 except Exception as e:
                     logger.error(f"加精消息 {msg_id} 失败: {e}")
@@ -560,12 +572,13 @@ class EssenceMessagePlugin(Star):
                 MessageChain([Plain(text=f"分析完成，共识别 {len(essence_ids)} 条神人语句，成功加精 {success_count} 条")])
             )
         else:
+            self._log("主动分析未识别到神人语句")
             await self.context.send_message(
                 event.session,
                 MessageChain([Plain(text="分析完成，未识别到神人语句")])
             )
 
-        logger.info(f"群 {group_id} 主动分析完成")
+        self._log(f"群 {group_id} 主动分析完成")
 
     async def _set_essence(self, event: AstrMessageEvent, message_id: str) -> None:
         """调用 OneBot API 设置精华消息"""
